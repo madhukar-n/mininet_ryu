@@ -1,0 +1,8 @@
+sh ovs-vsctl add-br s6
+sh ip link add s6-eth1 type veth peer name s3-eth4
+sh ovs-vsctl add-port s6 s6-eth1
+sh ovs-vsctl add-port s3 s3-eth4
+sh ip link set s3-eth4 up
+sh ip link set s6-eth1 up
+sh ovs-vsctl set-controller s6 tcp:127.0.0.1:6653
+

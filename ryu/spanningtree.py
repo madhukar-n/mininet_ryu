@@ -2,18 +2,21 @@ from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls, DEAD_DISPATCHER
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, ether_types
+from ryu.lib.packet import packet, ethernet, ether_types , lldp
 from ryu.topology import event
 from ryu.topology.api import get_switch, get_link , get_all_switch , get_all_link
 import copy
+from ryu.lib.packet.packet import Packet
+
 from ryu.controller import dpset
 from ryu.lib import dpid as dpid_lib
-from collections import deque
+from collections import deque , OrderedDict
 from threading import Lock
 
 UP = 1
 DOWN = 0
-start = 1
+
+# start = 1
 class SimpleSwitchSpanningTree(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     
@@ -25,6 +28,7 @@ class SimpleSwitchSpanningTree(app_manager.RyuApp):
         self.switches = []
         self.links = []
         self.host_ports = {}
+        self.flag = True
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
 
@@ -35,6 +39,17 @@ class SimpleSwitchSpanningTree(app_manager.RyuApp):
         ofp = dp.ofproto
         parser = dp.ofproto_parser
 
+        match = parser.OFPMatch(eth_type=0x88cc)
+        actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER,
+                                      ofp.OFPCML_NO_BUFFER)]
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+
+        dp.send_msg(parser.OFPFlowMod(
+            datapath=dp,
+        priority=65535,
+        match=match,
+        instructions=inst
+        ))
         
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER,
@@ -62,23 +77,34 @@ class SimpleSwitchSpanningTree(app_manager.RyuApp):
             dpid = switch.dp.id
             ports = set(p.port_no for p in switch.ports)
             used_ports = link_ports.get(dpid, set())
-            self.host_ports[dpid] = ports - used_ports
-
-        self.logger.info("Host ports : %s", self.host_ports)
+            if len(used_ports)!=0:
+                self.host_ports[dpid] = ports - used_ports
+        # self.logger.info("Link Ports : %s" , link_ports)
+        # self.logger.info("Host ports : %s", self.host_ports)
 
                 
 
     
-    def _build_spanning_tree(self, start):
+    def _build_spanning_tree(self):
         self.spanning_tree = {}
-        visited = {start}
-        queue = deque([start])
-        self.logger.info("Root bridge : %s" , start)
+        
         adj = {}
         for u, v in self.links:
             adj.setdefault(u[0], set()).add(v[0])
             adj.setdefault(v[0], set()).add(u[0])
         self.logger.info("Adjacency list : %s",adj)
+
+        start = None
+        adj = dict(sorted(adj.items()))
+        for u in adj:
+            if len(adj[u])!=0:
+                start = u
+                break
+
+        visited = {start}
+        queue = deque([start])
+        self.logger.info("Root bridge : %s" , start)
+
         while queue:
             u = queue.popleft()
             for v in adj.get(u, []):
@@ -102,29 +128,45 @@ class SimpleSwitchSpanningTree(app_manager.RyuApp):
         self.switches = copy.copy(self.topo_shape.topo_raw_switches)
         self.links = copy.copy(self.topo_shape.topo_links)
         self._compute_host_ports()
-        self._build_spanning_tree(start)
+        self._build_spanning_tree()
         # print(f"Links and switches : {self.topo_shape.topo_links} , {self.topo_shape.topo_switches}")
-
     
+
     @set_ev_cls(event.EventSwitchLeave, [MAIN_DISPATCHER, CONFIG_DISPATCHER, DEAD_DISPATCHER])
     def handler_switch_leave(self, ev):
         self.logger.info("Not tracking Switches, switch leaved.")
     
-
+    @set_ev_cls(event.EventLinkAdd)
+    @set_ev_cls(event.EventLinkDelete)
+    @set_ev_cls(event.EventLinkRequest)
+    def on_link(self,ev):
+        self.get_topology_data()
+    
     @set_ev_cls(event.EventSwitchEnter)
     def on_switch_enter(self, ev):
-
+        switch = ev.switch
+        self.logger.info("New switch entered : %s",switch)
         self.get_topology_data()
-        # self.topo_shape.topo_raw_switches = copy.copy(get_switch(self, None))
-        # self.topo_shape.topo_raw_links = copy.copy(get_link(self, None))
-
-        # self.topo_shape.print_links("EventSwitchEnter")
-        # self.topo_shape.print_switches("EventSwitchEnter")
-        # self.topo_shape.convert_raw_links_to_list()
-        # self.topo_shape.convert_raw_switch_to_list()
-        # self._compute_host_ports()
 
     
+    def _extract_lldp_info(self,pkt):
+        info = {}
+
+        lldp_pkt = pkt.get_protocol(lldp.lldp)
+        if not lldp_pkt:
+            return None
+
+        for tlv in lldp_pkt.tlvs:
+            if isinstance(tlv, lldp.ChassisID):
+                info['chassis_id'] = tlv.chassis_id
+            elif isinstance(tlv, lldp.PortID):
+                info['port_id'] = tlv.port_id
+            elif isinstance(tlv, lldp.TTL):
+                info['ttl'] = tlv.ttl
+            elif isinstance(tlv, lldp.SystemName):
+                info['system_name'] = tlv.system_name
+
+        return info
 
     @set_ev_cls(dpset.EventPortModify, MAIN_DISPATCHER)
     def port_modify_handler(self, ev):
@@ -168,6 +210,7 @@ class SimpleSwitchSpanningTree(app_manager.RyuApp):
         self.get_topology_data()
         self.topo_shape.lock.release()
     
+    
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -179,14 +222,14 @@ class SimpleSwitchSpanningTree(app_manager.RyuApp):
         eth = pkt.get_protocols(ethernet.ethernet)[0]
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+            packet_info = self._extract_lldp_info(pkt)
             return
-
         src = eth.src
         dst = eth.dst
 
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][src] = in_port
-
+        # self.logger.info("[PACKET_IN] From switch : %s port : %s" , dpid , src)
         parser = dp.ofproto_parser
         ofp = dp.ofproto
 
@@ -206,7 +249,7 @@ class SimpleSwitchSpanningTree(app_manager.RyuApp):
 
         valid_ports = {p.port_no for p in dp.ports.values()}
         out_ports &= valid_ports
-
+        # self.logger.info("Flooding through following ports : %s" , out_ports)
         actions = [parser.OFPActionOutput(p) for p in out_ports]
 
         match = parser.OFPMatch(in_port=in_port,
@@ -234,8 +277,6 @@ class SimpleSwitchSpanningTree(app_manager.RyuApp):
             actions=actions,
             data=msg.data
         ))
-
-
 
 class TopoStructure():
     def __init__(self, *args, **kwargs):
