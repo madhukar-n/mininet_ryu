@@ -7,7 +7,7 @@ from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet , lldp
+from ryu.lib.packet import ethernet , lldp , arp
 from ryu.lib.packet.lldp  import ChassisID
 from ryu.lib.packet import ether_types
 from ryu.lib.packet.packet import Packet
@@ -85,7 +85,7 @@ class SpanningTreeSwitch2(app_manager.RyuApp):
         self.logger.info("[PORT CHANGE] %s %s" , dp.id , port)
         if msg.reason == dp.ofproto.OFPPR_ADD:
             self.switch_ports.setdefault(dp.id, {})
-            self.switch_ports[dp.id][port.port_no] = {'neighbour': 'host'}
+            self.switch_ports[dp.id][port.port_no] = {'neighbour': 'host' , 'dpid' : None}
             self.host_ports[dp.id].add(port.port_no)
             self.send_lldp(dp)
 
@@ -171,7 +171,7 @@ class SpanningTreeSwitch2(app_manager.RyuApp):
         ofp = datapath.ofproto
         self.logger.info("handle_port_info:\n[DPID] %s [PORTS]" , datapath.id)
         for port in ev.msg.body:
-            self.logger.info("%s " , port)
+            # self.logger.info("%s " , port)
             if port.port_no == (ofp.OFPP_CONTROLLER + 1) or port.port_no == ofp.OFPP_CONTROLLER:
                 continue
             self.switch_ports[datapath.id][port.port_no] = {"neighbour" : "host" , "dpid" : None}
@@ -196,6 +196,11 @@ class SpanningTreeSwitch2(app_manager.RyuApp):
                                     match=match, instructions=inst)
         datapath.send_msg(mod)
 
+    def handle_arp_packet(self,datapath,packet,in_port):
+        arp_pkt = packet.get_protocol(arp.arp)
+
+        self.logger.info("[ARP PACKET] %s",arp_pkt)
+
     def handle_lldp_packet(self,datapath , packet, in_port):
 
         eth = packet.get_protocols(ethernet.ethernet)[0]
@@ -215,12 +220,14 @@ class SpanningTreeSwitch2(app_manager.RyuApp):
         self.logger.info("[AFTER LLDP HANDLE] %s [HOST PORTS] %s" , json.dumps(self.switch_ports) , self.host_ports)
         self.adjacency_list = self.build_adjacency_list()
         #Compute the time elapsed to construct the spanning tree
+        self.logger.info("[SWITCHES] %s" , self.switch_ports)
         self.logger.info("[ADJACENCY LIST] %s" , self.adjacency_list)
         start = time.perf_counter()
         self.spanning_tree = self._build_spanning_tree()
         end = time.perf_counter()
         self.time_elapsed = end - start
         self.logger.info("[SPANNING TREE] %s" , self.spanning_tree)
+        self.logger.info("[TIME ELAPSED] %s" , self.time_elapsed)
 
 
 
@@ -244,9 +251,12 @@ class SpanningTreeSwitch2(app_manager.RyuApp):
         dst = eth.dst
         src = eth.src
         
+        if eth.ethertype == ether_types.ETH_TYPE_ARP:
+            self.handle_arp_packet(datapath,pkt,in_port)
+            # self.logger.info("%s %s %s %s\n [PKT] %s" , dpid , src, dst , in_port , pkt)
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             # handle the lldp packet
-            self.logger.info("packet in %s %s %s %s %s", dpid, src, dst, in_port , hex(eth.ethertype))
+            # self.logger.info("packet in %s %s %s %s %s", dpid, src, dst, in_port , hex(eth.ethertype))
             # self.logger.info("[LLDP PACKET] %s" , pkt)
             self.handle_lldp_packet(datapath , pkt , in_port)
             return
@@ -262,15 +272,20 @@ class SpanningTreeSwitch2(app_manager.RyuApp):
             for neighbour in self.spanning_tree.get(dpid, []):
                 self.logger.info(neighbour)
                 out_ports.add(neighbour[1])
-            out_ports |= self.host_ports.get(dpid, set())
+            
+            for neighbour in self.switch_ports[dpid]:
+                if self.switch_ports[dpid][neighbour]['neighbour'] == 'host':
+                    out_ports.add(neighbour)
 
             out_ports.discard(in_port)
         # self.logger.info("[OUTPUT PORTS %s]" , out_ports)
-        valid_ports = {p.port_no for p in datapath.ports.values()}
-        out_ports &= valid_ports
-        # self.logger.info("Flooding through following ports : %s" , out_ports)
+        # valid_ports = {p.port_no for p in datapath.ports.values()}
+        # out_ports &= valid_ports
+        if eth.ethertype == ether_types.ETH_TYPE_ARP:
+            self.logger.info("[DPID] %s [IN_PORT] %s | [PORTS TO FLOOD] %s" , dpid,in_port,out_ports)
+        # if eth.ethertype == ether_types.ETH_TYPE_ARP:
+            # self.logger.info("Flooding through following ports : %s" , out_ports)
         actions = [parser.OFPActionOutput(p) for p in out_ports]
-
         match = parser.OFPMatch(in_port=in_port,
                                 eth_src=src,
                                 eth_dst=dst)
